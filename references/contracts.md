@@ -120,3 +120,81 @@ Hook errors reach the caller wrapped by PancakeSwap Infinity as
 | `InvalidTaxPeriod()` | `0xbdd72a6b` | factory (`create`) |
 | `TooLittleReceived(uint256)` | `0x4704aaf8` | router |
 | `ERC20InsufficientBalance` / `ERC20InsufficientAllowance` | `0xe450d38c` / `0xfb8f41b2` | token |
+
+## Stock memes (`StockCurveHook`, `StockRouter`, `StockLaunchFactory`)
+
+A second, separate set of contracts: launches paired with an allowlisted bStock (Binance-issued tokenized share,
+18 decimals, ERC-8056 `uiMultiplier()` `0xa60bf13d`) instead of BNB. Addresses: `SUAN_STOCK_HOOK`,
+`SUAN_STOCK_ROUTER`, `SUAN_STOCK_FACTORY`. Same windows, rates and events as above; every fee and payout is in the
+bStock.
+
+### Pool
+
+`currency0` / `currency1` are the meme and the bStock sorted by address, so the meme can be either side
+(`memeIsCurrency0` in `launchInfo`). When the meme is currency0 `sqrtPriceX96` is bStock per meme and buys raise it;
+otherwise it is meme per bStock and buys lower it. Price of one meme in raw bStock: `sqrtP² / 2^192` (meme is
+currency0) or `2^192 / sqrtP²`. The start market cap is the factory's per-base `startAmountOf(base)` (≈ $3K).
+
+### Hook
+
+| Function | Selector | Notes |
+|---|---|---|
+| `baseOf(address token) returns (address)` | `0x23d7b2bc` | The bStock of a stock meme, `0x0` for anything else: how the CLI tells the kinds apart |
+| `launchInfo(address token) returns (LaunchView)` | `0x8025bf9a` | 27 words: `exists`, `base`, `memeIsCurrency0`, then the 24 words of the BNB `LaunchView` after `exists` |
+| `poolKeyOf(address token)` | `0x8652edf9` | As above |
+| `owedOf(address)` / `suanOwedOf(address)` | `0x228db984` / `0xc17d873a` | bStock owed per bucket; `dispatch` pays the platform share to `StockFeeSink`, which converts it to BNB for `SuanBuyBurn` |
+
+### Router
+
+| Function | Selector | Notes |
+|---|---|---|
+| `buy(PoolKey key, uint256 amountIn, uint256 minOut, address recipient)` | `0x79002279` | Pays `amountIn` of the bStock (approve the router first) |
+| `buyWithBnb(PoolKey key, bytes path, uint256 minBaseOut, uint256 minOut, address recipient) payable` | `0xae40bdea` | Wraps `msg.value`, swaps WBNB → bStock on PancakeSwap V3 along `path` (at least `minBaseOut`), buys the meme; leftover bStock goes back to the caller |
+| `sell(PoolKey key, uint256 amountIn, uint256 minOut, address recipient)` | `0x2be26629` | Meme → bStock |
+| `sellForBnb(PoolKey key, uint256 amountIn, bytes path, uint256 minBnbOut, address recipient)` | `0xca08e600` | Meme → bStock → WBNB on V3 → BNB to the recipient |
+| `bnbToBase(bytes path, address base, uint256 minOut, address recipient) payable` | `0x79e9643f` | BNB → bStock only (fund a presale) |
+
+`path` is the PancakeSwap V3 encoding `token (20 bytes) | fee (3 bytes) | token …`, starting and ending at the right
+tokens (`InvalidPath()` `0x20db8267` otherwise). The CLI quotes each candidate route with QuoterV2
+(`0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997`, `quoteExactInput(bytes,uint256)` `0xcdca1753`, simulated) and takes the
+best: the direct bStock/WBNB pool, or WBNB –100– USDT (`0x55d398326f99059fF775485246999027B3197955`) – bStock.
+
+| bStock | Address | USDT pool fee | WBNB pool fee |
+|---|---|---|---|
+| NVDAB (NVIDIA) | `0x02fca66c1d1afb4e2a7884261eb00f63598a7436` | 2500 | 2500 |
+| SPCXB (SpaceX) | `0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1` | 2500 | 2500 |
+| BNCB (CEA Industries) | `0x4902c5ebc598265ed2212b559b042de8a5eeec3f` | 2500 | 2500 |
+| TSLAB (Tesla) | `0x5b1910eaad6450e50f816082aa078c41f10c292f` | 2500 | 2500 |
+| QQQB (Invesco QQQ) | `0x205812cdbed920aff76c6580abd681a46d11efc7` | 100 | 500 |
+| SKHYB (SK hynix) | `0xca750ef65f295bbecd685abf54e82caf297bdb61` | 2500 | 2500 |
+| AAPLB (Apple) | `0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a` | 2500 | 2500 |
+| CRCLB (Circle) | `0x80f3d493ebce97e343c53d29a137942416b4ffc0` | 2500 | — |
+
+The factory's allowlist (`startAmountOf(base)` `0xda448f4e`, non-zero = allowed) is the source of truth; the owner adds
+or removes bases for new launches only.
+
+### Factory
+
+`create(CreateParams)` `0x48ddd866`, `CreateParams` = `(address base, uint256 presaleAmount, string name,
+string symbol, string meta, address founder, uint16 buyTaxBps, uint16 sellTaxBps, uint16 agentBuyTaxBps,
+uint16 agentSellTaxBps, uint8 wFounder, uint8 wHolder, uint8 wBurn, uint8 wLiquidity, uint256 minShare,
+bool agentOnlyRewards, bool antiSniper, uint64 aiOnlySeconds, uint64 holdCapSeconds, uint64 taxSeconds)`.
+`msg.value` = `launchFee()` (`0xcf3cf573`, 0.005 BNB, to `SuanBuyBurn`); `presaleAmount` of the bStock is pulled from
+the creator with `transferFrom` (approve the factory first). `launchesOpen()` `0xdb8bf629`.
+`TokenLaunched(address indexed token, address indexed creator, address indexed base, address rewards, string name,
+string symbol, string meta)` — topic `0x16d6307226677bbd19237ea7d54cbba35d46bce786def5a8ac9694416680f7df`.
+`LaunchRegistered(address indexed token, bytes32 indexed poolId, address creator, address base, bool memeIs0)` —
+topic `0x8dfbdf4c0689fc6673474c1eab825a2893bcea1b41fbaf9f7db1118fd537b9c9`. `Swapped` and `FeeTaken` have the same
+signatures (and topics) as above, with amounts in the bStock.
+
+### Holder rewards (`StockHolderRewards`)
+
+Paid in the bStock. `pending(address)` `0x5eebea20`, `claim()` `0x4e71d92d`; the token's `rewards()` `0x9ec5a894`
+gives the address. A claim the bStock refuses stays claimable.
+
+| Error | Selector | Raised by |
+|---|---|---|
+| `BaseNotAllowed(address)` | `0x4fbfadb9` | factory (base not allowlisted) |
+| `LaunchesClosed()` / `LaunchFeeRequired(uint256)` | `0x6f9f068c` / `0xa4082532` | factory |
+| `InvalidTax()` / `InvalidWeights()` / `InvalidMinShare()` / `InvalidMeta()` | `0x37d4ed5b` / `0x84677ce8` / `0x12b3f9a7` / `0x8bb27af0` | factory |
+| `UnknownPool()` / `InvalidPath()` | `0xf7139e33` / `0x20db8267` | router |

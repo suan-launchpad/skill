@@ -7,11 +7,20 @@
 // Usage: node suan-launchpad.mjs <command> '<json_params>'
 //
 // Commands:
-//   info        Stage (.ai window / hold-cap window / tax period / open), its end times, fees for this wallet,
-//               hold-cap room
-//   quote-buy   Simulate a BNB buy through the router and build its calldata
-//   quote-sell  Simulate a token sell through the router and build its calldata (+ approve if needed)
-//   receipt     Check a submitted transaction and decode its fee and transfer events
+//   info               Stage (.ai window / hold-cap window / tax period / open), its end times, fees for this wallet,
+//                      hold-cap room; for stock memes also the paired bStock, its price and the meme price in it
+//   quote-buy          Simulate a buy through the router and build its calldata (stock memes: pay BNB or the bStock)
+//   quote-sell         Simulate a token sell through the router and build its calldata (+ approve if needed)
+//                      (stock memes: receive BNB or the bStock)
+//   receipt            Check a submitted transaction and decode its fee and transfer events
+//   bases              Stock memes: the bStocks new launches can pair with (factory allowlist)
+//   quote-bnb-to-base  Stock memes: swap BNB to a bStock through the stock router (e.g. to fund a presale)
+//   build-create       Stock memes: build the launch (approve the factory for the presale + create)
+//   claim-rewards      Holder rewards (BNB, or the bStock for stock memes): pending amount and the claim call
+//
+// Stock memes are launches paired with an allowlisted bStock instead of BNB. They have their own hook, router and
+// factory (`stockHook`, `stockRouter`, `stockFactory` params or SUAN_STOCK_HOOK / SUAN_STOCK_ROUTER /
+// SUAN_STOCK_FACTORY). A token is a stock meme when `stockHook.baseOf(token)` is non-zero; the commands detect it.
 //
 // Quotes are exact simulations of the real swap (router -> Infinity Vault -> hook), run as `eth_call` from the
 // wallet so the hook sees the same identity (`tx.origin`) as the real trade.
@@ -23,16 +32,46 @@ import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 // ---- constants ----
-const TIMEOUT_MS = 15_000;
+/** Per-request RPC timeout; SUAN_RPC_TIMEOUT_MS raises it (a fresh local fork fetches state slowly). */
+const TIMEOUT_MS = Number(process.env.SUAN_RPC_TIMEOUT_MS) > 0 ? Number(process.env.SUAN_RPC_TIMEOUT_MS) : 15_000;
 const CHAIN_ID = '56';
 /** The SUAN Agent Launchpad on BSC mainnet, published on launch.suan.bid. */
 const MAINNET = { hook: '0xa8E32E5Bc1d3Ce8aFe6bf3ef2069F1Fc7171c061', router: '0x119dCa55DCbB37998E9bA0845196acc0FFf2FAc2' };
+/** The stock-meme launchpad on BSC mainnet: not deployed yet, so it must come from params or env until then. */
+const MAINNET_STOCK = { hook: '0x6ddE8C213f0fA67cDB9546bB0de5ef595185c196', router: '0xCFA7D82BfB4Ed21aDaCFC36287b7031264ec9314', factory: '0x55e1c1914D5e11a37Cd10deDF327E56F04ba979C' };
 const DEFAULT_RPCS = ['https://bsc-dataseed.bnbchain.org', 'https://bsc-dataseed-public.bnbchain.org', 'https://bsc-dataseed.defibit.io'];
 export const AGENT_ID_NFT = '0x60b9262456de011f7d15a54cdd8c48baaa8b022f'; // SPACE ID Agent ID (.ai), non-transferable
 const MAX_UINT256 = (1n << 256n) - 1n;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const BPS = 10_000n;
 const DEFAULT_SLIPPAGE_BPS = 1_000n; // 10%
 const ALLOWANCE_SLOT = 1n; // OpenZeppelin ERC20 v5: _balances = 0, _allowances = 1
+
+// PancakeSwap V3: the BNB <-> bStock legs of stock-meme trades.
+export const WBNB = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c';
+export const USDT = '0x55d398326f99059ff775485246999027b3197955';
+export const V3_QUOTER = '0xb048bbc1ee6b733fffcfb9e9cef7375518e25997'; // QuoterV2: quoteExactInput, simulated
+export const USDT_WBNB_FEE = 100; // the deepest USDT/WBNB V3 pool; every via-USDT route goes through it
+/**
+ * The first batch of bStock bases (Binance-issued tokenized shares, 18 decimals). Fee tiers are the deepest
+ * PancakeSwap V3 pools (measured 2026-10-29); quotes compare the routes at run time and take the better one.
+ * `wbnbFee: null` = no direct WBNB pool worth routing through. `usdtPool` gives the USD price.
+ */
+export const STOCK_BASES = [
+  { symbol: 'NVDAB', name: 'NVIDIA', address: '0x02fca66c1d1afb4e2a7884261eb00f63598a7436', usdtFee: 2500, usdtPool: '0x8fb4243b553ac29ba088acf00b9b7da24bd6690c', wbnbFee: 2500 },
+  { symbol: 'SPCXB', name: 'SpaceX', address: '0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1', usdtFee: 2500, usdtPool: '0x977daffc095b33872e2741c19568925015c35b4d', wbnbFee: 2500 },
+  { symbol: 'BNCB', name: 'CEA Industries', address: '0x4902c5ebc598265ed2212b559b042de8a5eeec3f', usdtFee: 2500, usdtPool: '0x32c51041f3d7a66ac14aba7485444efb6e15efe1', wbnbFee: 2500 },
+  { symbol: 'TSLAB', name: 'Tesla', address: '0x5b1910eaad6450e50f816082aa078c41f10c292f', usdtFee: 2500, usdtPool: '0xb0f5e5400e8f0f7c242f2b7740c004f020579c41', wbnbFee: 2500 },
+  { symbol: 'QQQB', name: 'Invesco QQQ', address: '0x205812cdbed920aff76c6580abd681a46d11efc7', usdtFee: 100, usdtPool: '0xe531fcb1f5a195de7608b9f4f9518544c2cdb693', wbnbFee: 500 },
+  { symbol: 'SKHYB', name: 'SK hynix', address: '0xca750ef65f295bbecd685abf54e82caf297bdb61', usdtFee: 2500, usdtPool: '0xd7d30f434b12f7ed9b0ae11ff1c754745a10ad52', wbnbFee: 2500 },
+  { symbol: 'AAPLB', name: 'Apple', address: '0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a', usdtFee: 2500, usdtPool: '0xe9b9998b2ec5430d2246c7f1f8d9f298c97d7365', wbnbFee: 2500 },
+  { symbol: 'CRCLB', name: 'Circle', address: '0x80f3d493ebce97e343c53d29a137942416b4ffc0', usdtFee: 2500, usdtPool: '0x29967c54c5bf12e8158c8894376064b30ebab297', wbnbFee: null },
+];
+/** A base by address or symbol (case-insensitive), or undefined. */
+export const stockBaseOf = (x) => {
+  const k = String(x ?? '').trim().toLowerCase();
+  return STOCK_BASES.find((b) => b.address === k || b.symbol.toLowerCase() === k);
+};
 
 export const BASE_FEE_BPS = 100n; // 1% on every trade: 0.5% buys back and burns $SUAN + 0.5% creator (or holders)
 export const PERMANENT = (1n << 64n) - 1n; // `taxEnd` of a launch whose tax period never ends
@@ -69,6 +108,22 @@ export const SEL = {
   holdCapUntil: '0xea8012b7',
   taxEnd: '0x672a2047',
   symbol: '0x95d89b41',
+  rewards: '0x9ec5a894',
+  pending: '0x5eebea20',
+  claim: '0x4e71d92d',
+  // stock memes
+  baseOf: '0x23d7b2bc',
+  stockBuy: '0x79002279',
+  buyWithBnb: '0xae40bdea',
+  sellForBnb: '0xca08e600',
+  bnbToBase: '0x79e9643f',
+  stockCreate: '0x48ddd866',
+  launchFee: '0xcf3cf573',
+  launchesOpen: '0xdb8bf629',
+  startAmountOf: '0xda448f4e',
+  quoteExactInput: '0xcdca1753',
+  uiMultiplier: '0xa60bf13d',
+  slot0: '0x3850c7bd',
 };
 
 export const TOPIC = {
@@ -96,6 +151,16 @@ export const ERRORS = {
   '0x9dba2911': ['INVALID_AI_ONLY', 'The .ai window must be 2–30 minutes'],
   '0x99dda1c8': ['INVALID_HOLD_CAP', 'The hold-cap window must be at least the .ai window and at most 24 hours'],
   '0xbdd72a6b': ['INVALID_TAX_PERIOD', 'The tax period must be 15–365 days, or permanent'],
+  // stock memes (factory, router)
+  '0x4fbfadb9': ['BASE_NOT_ALLOWED', 'This bStock is not allowlisted for new launches (see the `bases` command)'],
+  '0x20db8267': ['INVALID_PATH', 'The PancakeSwap V3 path does not start and end at the right tokens'],
+  '0xf7139e33': ['UNKNOWN_POOL', 'This pool key is not a stock-meme pool'],
+  '0x6f9f068c': ['LAUNCHES_CLOSED', 'Creation is not open to everyone yet'],
+  '0xa4082532': ['LAUNCH_FEE_REQUIRED', 'Send exactly the launch fee'],
+  '0x84677ce8': ['INVALID_WEIGHTS', 'Tax weights must sum to 100 when taxed, 0 otherwise'],
+  '0x37d4ed5b': ['INVALID_TAX', 'The normal rate must be the .ai rate + 3 points, at most 10%'],
+  '0x12b3f9a7': ['INVALID_MIN_SHARE', 'The holder-rewards minimum must be at least 10,000 tokens'],
+  '0x8bb27af0': ['INVALID_META', 'The meta CID must be at most 128 bytes'],
 };
 const WRAPPED_ERROR = '0x90bfb865'; // CustomRevert.WrappedError(address target, bytes4 selector, bytes reason, bytes details)
 const ERROR_STRING = '0x08c379a0'; // Error(string)
@@ -188,6 +253,83 @@ export function encodeSell(key, amountIn, minOut, recipient) {
   return SEL.sell + encPoolKey(key) + word(amountIn) + word(minOut) + encAddr(recipient);
 }
 
+// ---- stock memes: encoders ----
+
+/** Dynamic `bytes` tail: length word + data right-padded to whole words. */
+const encBytesTail = (hex) => {
+  const h = strip(hex);
+  return word(h.length / 2) + h.padEnd(Math.ceil(h.length / 64) * 64, '0');
+};
+const encStringTail = (str) => encBytesTail(Array.from(new TextEncoder().encode(str), (b) => b.toString(16).padStart(2, '0')).join(''));
+
+/** PancakeSwap V3 path `token | fee (3 bytes) | token | …`. */
+export function encodeV3Path(tokens, fees) {
+  if (tokens.length < 2 || fees.length !== tokens.length - 1) throw fail('INVALID_PATH', 'A V3 path needs n tokens and n - 1 fees');
+  return '0x' + tokens.map((t, i) => strip(t).toLowerCase() + (i < fees.length ? fees[i].toString(16).padStart(6, '0') : '')).join('');
+}
+
+/** Candidate routes WBNB -> base: the direct WBNB pool (if any) and WBNB -> USDT -> base. */
+export function routesFromBnb(base) {
+  const viaUsdt = { via: 'USDT', tokens: [WBNB, USDT, base.address], fees: [USDT_WBNB_FEE, base.usdtFee] };
+  return base.wbnbFee === null ? [viaUsdt] : [{ via: 'WBNB', tokens: [WBNB, base.address], fees: [base.wbnbFee] }, viaUsdt];
+}
+
+/** Candidate routes base -> WBNB (selling a stock meme on to BNB). */
+export const routesToBnb = (base) => routesFromBnb(base).map((r) => ({ ...r, tokens: [...r.tokens].reverse(), fees: [...r.fees].reverse() }));
+
+export function encodeStockBuy(key, amountIn, minOut, recipient) {
+  return SEL.stockBuy + encPoolKey(key) + word(amountIn) + word(minOut) + encAddr(recipient);
+}
+
+export function encodeBuyWithBnb(key, path, minBaseOut, minOut, recipient) {
+  return SEL.buyWithBnb + encPoolKey(key) + word(10 * 32) + word(minBaseOut) + word(minOut) + encAddr(recipient) + encBytesTail(path);
+}
+
+export function encodeSellForBnb(key, amountIn, path, minBnbOut, recipient) {
+  return SEL.sellForBnb + encPoolKey(key) + word(amountIn) + word(10 * 32) + word(minBnbOut) + encAddr(recipient) + encBytesTail(path);
+}
+
+export function encodeBnbToBase(path, base, minOut, recipient) {
+  return SEL.bnbToBase + word(4 * 32) + encAddr(base) + word(minOut) + encAddr(recipient) + encBytesTail(path);
+}
+
+export const encodeQuoteExactInput = (path, amountIn) => SEL.quoteExactInput + word(2 * 32) + word(amountIn) + encBytesTail(path);
+
+/** `StockLaunchFactory.create(CreateParams)`: one dynamic tuple of 20 fields (3 strings). */
+export function encodeStockCreate(c) {
+  const tails = [encStringTail(c.name), encStringTail(c.symbol), encStringTail(c.meta)];
+  const offsets = [];
+  let off = 20 * 32;
+  for (const t of tails) {
+    offsets.push(off);
+    off += t.length / 2;
+  }
+  const head = [
+    encAddr(c.base), word(c.presaleAmount), word(offsets[0]), word(offsets[1]), word(offsets[2]), encAddr(c.founder),
+    word(c.buyTaxBps), word(c.sellTaxBps), word(c.agentBuyTaxBps), word(c.agentSellTaxBps),
+    word(c.wFounder), word(c.wHolder), word(c.wBurn), word(c.wLiquidity), word(c.minShare),
+    word(c.agentOnlyRewards ? 1 : 0), word(c.antiSniper ? 1 : 0), word(c.aiOnlySeconds), word(c.holdCapSeconds), word(c.taxSeconds),
+  ];
+  return SEL.stockCreate + word(32) + head.join('') + tails.join('');
+}
+
+const Q192 = 1n << 192n;
+const WAD = 10n ** 18n;
+
+/** Price of one whole meme token in raw bStock wei. The meme can sort either side of the bStock in the pool. */
+export function stockPriceWad(sqrtPriceX96, memeIsCurrency0) {
+  if (sqrtPriceX96 === 0n) return 0n;
+  const sq = sqrtPriceX96 * sqrtPriceX96;
+  return memeIsCurrency0 ? (sq * WAD) / Q192 : (Q192 * WAD) / sq;
+}
+
+/** USD (18 decimals) per raw bStock unit from its USDT V3 pool's sqrtPriceX96 (both tokens 18 decimals). */
+export function usdWadFromV3Sqrt(sqrtPriceX96, base) {
+  if (sqrtPriceX96 === 0n) return 0n;
+  const sq = sqrtPriceX96 * sqrtPriceX96;
+  return base.toLowerCase() < USDT ? (sq * WAD) / Q192 : (Q192 * WAD) / sq;
+}
+
 /** `LaunchView`, a static tuple of 25 words, in order. */
 const LAUNCH_FIELDS = [
   'exists', 'creator', 'founder', 'rewards', 'createBlock', 'launchTime', 'aiOnlyUntil', 'holdCapUntil', 'taxEnd',
@@ -204,6 +346,19 @@ export function decodeLaunchInfo(hex) {
   const out = {};
   LAUNCH_FIELDS.forEach((f, i) => {
     out[f] = ADDR_FIELDS.has(f) ? wordAddr(w[i]) : BOOL_FIELDS.has(f) ? w[i] === 1n : w[i];
+  });
+  return out;
+}
+
+/** The stock hook's `LaunchView`: 27 words, with `base` and `memeIsCurrency0` after `exists`. */
+const STOCK_LAUNCH_FIELDS = ['exists', 'base', 'memeIsCurrency0', ...LAUNCH_FIELDS.slice(1)];
+
+export function decodeStockLaunchInfo(hex) {
+  const w = words(hex);
+  if (w.length < STOCK_LAUNCH_FIELDS.length) throw fail('BAD_HOOK', 'The `stockHook` address did not answer launchInfo() — wrong address or not a stock-meme hook');
+  const out = {};
+  STOCK_LAUNCH_FIELDS.forEach((f, i) => {
+    out[f] = f === 'base' || ADDR_FIELDS.has(f) ? wordAddr(w[i]) : f === 'memeIsCurrency0' || BOOL_FIELDS.has(f) ? w[i] === 1n : w[i];
   });
   return out;
 }
@@ -315,33 +470,94 @@ export function makeRpc(urls) {
 }
 
 // ---- context ----
-function resolveConfig(p) {
+const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+
+function optionalAddress(value, name) {
+  if (value === undefined || value === null || value === '') return null;
+  if (!ADDR_RE.test(value)) throw fail('INVALID_PARAM', `\`${name}\` must be a 0x address`);
+  return value.toLowerCase();
+}
+
+/** Addresses and RPC; `token` is optional here (commands that need one check it). */
+function resolveBaseConfig(p) {
   const hook = p.hook ?? process.env.SUAN_LAUNCHPAD_HOOK ?? MAINNET.hook;
   const router = p.router ?? process.env.SUAN_LAUNCHPAD_ROUTER ?? MAINNET.router;
-  if (!/^0x[0-9a-fA-F]{40}$/.test(hook ?? '')) throw fail('INVALID_PARAM', 'Missing `hook` (or SUAN_LAUNCHPAD_HOOK)');
-  if (!/^0x[0-9a-fA-F]{40}$/.test(router ?? '')) throw fail('INVALID_PARAM', 'Missing `router` (or SUAN_LAUNCHPAD_ROUTER)');
-  if (!/^0x[0-9a-fA-F]{40}$/.test(p.token ?? '')) throw fail('INVALID_PARAM', '`token` must be a 0x address');
-  if (p.wallet !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(p.wallet)) throw fail('INVALID_PARAM', '`wallet` must be a 0x address');
+  if (!ADDR_RE.test(hook ?? '')) throw fail('INVALID_PARAM', 'Missing `hook` (or SUAN_LAUNCHPAD_HOOK)');
+  if (!ADDR_RE.test(router ?? '')) throw fail('INVALID_PARAM', 'Missing `router` (or SUAN_LAUNCHPAD_ROUTER)');
+  if (p.wallet !== undefined && !ADDR_RE.test(p.wallet)) throw fail('INVALID_PARAM', '`wallet` must be a 0x address');
+  const stock = {
+    hook: optionalAddress(p.stockHook ?? process.env.SUAN_STOCK_HOOK ?? MAINNET_STOCK.hook, 'stockHook'),
+    router: optionalAddress(p.stockRouter ?? process.env.SUAN_STOCK_ROUTER ?? MAINNET_STOCK.router, 'stockRouter'),
+    factory: optionalAddress(p.stockFactory ?? process.env.SUAN_STOCK_FACTORY ?? MAINNET_STOCK.factory, 'stockFactory'),
+  };
   const urls = p.rpc ? [p.rpc] : process.env.BSC_RPC_URL ? [process.env.BSC_RPC_URL] : DEFAULT_RPCS;
-  return { hook: hook.toLowerCase(), router: router.toLowerCase(), token: p.token.toLowerCase(), wallet: p.wallet?.toLowerCase(), rpc: makeRpc(urls) };
+  return { hook: hook.toLowerCase(), router: router.toLowerCase(), stock, wallet: p.wallet?.toLowerCase(), rpc: makeRpc(urls) };
+}
+
+function resolveConfig(p) {
+  const cfg = resolveBaseConfig(p);
+  if (!ADDR_RE.test(p.token ?? '')) throw fail('INVALID_PARAM', '`token` must be a 0x address');
+  return { ...cfg, token: p.token.toLowerCase() };
+}
+
+function requireStock(cfg, ...parts) {
+  for (const part of parts) {
+    if (!cfg.stock[part]) {
+      const env = { hook: 'SUAN_STOCK_HOOK', router: 'SUAN_STOCK_ROUTER', factory: 'SUAN_STOCK_FACTORY' }[part];
+      throw fail('STOCK_NOT_CONFIGURED', `Stock memes need \`stock${part[0].toUpperCase()}${part.slice(1)}\` (or ${env})`);
+    }
+  }
 }
 
 const call = (rpc, to, data, from) => rpc('eth_call', [{ to, data, ...(from ? { from } : {}) }, 'latest']);
+const callWord = async (rpc, to, data) => words(await call(rpc, to, data))[0] ?? 0n;
+
+/** Whether `token` is a stock meme: the stock hook (when configured) returns its base from `baseOf`. */
+async function stockBaseOfToken(cfg, token) {
+  if (!cfg.stock.hook) return null;
+  const base = wordAddr(await callWord(cfg.rpc, cfg.stock.hook, SEL.baseOf + encAddr(token)));
+  return BigInt(base) === 0n ? null : base;
+}
+
+/** Symbol, `uiMultiplier` and USD price of a bStock (any of them null when unavailable). */
+async function loadBase(rpc, address) {
+  const meta = stockBaseOf(address);
+  const [symHex, multHex, slotHex] = await Promise.all([
+    call(rpc, address, SEL.symbol).catch(() => null),
+    call(rpc, address, SEL.uiMultiplier).catch(() => null),
+    meta ? call(rpc, meta.usdtPool, SEL.slot0).catch(() => null) : null,
+  ]);
+  const uiMultiplier = multHex ? words(multHex)[0] ?? null : null;
+  const usdPerRaw = slotHex ? usdWadFromV3Sqrt(words(slotHex)[0] ?? 0n, address) : null;
+  return { address, symbol: (symHex && decodeString(symHex)) || meta?.symbol || null, name: meta?.name ?? null, meta, uiMultiplier, usdPerRaw };
+}
 
 async function loadContext(cfg) {
-  const { rpc, hook, token, wallet } = cfg;
-  const [infoHex, keyHex, capHex, symHex, block] = await Promise.all([
+  const { rpc, token, wallet } = cfg;
+  const baseAddr = await stockBaseOfToken(cfg, token);
+  const kind = baseAddr ? 'stock' : 'bnb';
+  const hook = kind === 'stock' ? cfg.stock.hook : cfg.hook;
+  if (kind === 'stock') requireStock(cfg, 'router');
+  const router = kind === 'stock' ? cfg.stock.router : cfg.router;
+  const [infoHex, keyHex, capHex, symHex, block, rewardsHex, base] = await Promise.all([
     call(rpc, hook, SEL.launchInfo + encAddr(token)),
     call(rpc, hook, SEL.poolKeyOf + encAddr(token)),
     call(rpc, token, SEL.holdCap).catch(() => null),
     call(rpc, token, SEL.symbol).catch(() => null),
     rpc('eth_getBlockByNumber', ['latest', false]),
+    call(rpc, token, SEL.rewards).catch(() => null),
+    baseAddr ? loadBase(rpc, baseAddr) : null,
   ]);
-  const info = decodeLaunchInfo(infoHex);
+  const info = kind === 'stock' ? decodeStockLaunchInfo(infoHex) : decodeLaunchInfo(infoHex);
   if (!info.exists) throw fail('UNKNOWN_LAUNCH', 'This token was not launched through this SUAN Agent Launchpad hook');
   const now = BigInt(block.timestamp);
   const ctx = {
     ...cfg,
+    kind,
+    hook,
+    router,
+    base,
+    rewards: rewardsHex ? wordAddr(words(rewardsHex)[0]) : info.rewards,
     info,
     key: decodePoolKey(keyHex),
     holdCap: capHex ? words(capHex)[0] : 0n,
@@ -350,11 +566,14 @@ async function loadContext(cfg) {
     stage: stageOf(info, now),
   };
   if (wallet) {
-    const [agentHex, balHex, bnbHex, allowHex] = await Promise.all([
+    const [agentHex, balHex, bnbHex, allowHex, baseBal, baseAllow, pending] = await Promise.all([
       call(rpc, AGENT_ID_NFT, SEL.balanceOf + encAddr(wallet)),
       call(rpc, token, SEL.balanceOf + encAddr(wallet)),
       rpc('eth_getBalance', [wallet, 'latest']),
-      call(rpc, token, SEL.allowance + encAddr(wallet) + encAddr(cfg.router)),
+      call(rpc, token, SEL.allowance + encAddr(wallet) + encAddr(router)),
+      base ? callWord(rpc, base.address, SEL.balanceOf + encAddr(wallet)) : null,
+      base ? callWord(rpc, base.address, SEL.allowance + encAddr(wallet) + encAddr(router)) : null,
+      callWord(rpc, ctx.rewards, SEL.pending + encAddr(wallet)).catch(() => null),
     ]);
     ctx.walletState = {
       address: wallet,
@@ -362,6 +581,9 @@ async function loadContext(cfg) {
       tokenBalance: words(balHex)[0],
       bnbBalance: BigInt(bnbHex),
       routerAllowance: words(allowHex)[0],
+      baseBalance: baseBal,
+      baseRouterAllowance: baseAllow,
+      pendingRewards: pending,
       isCreator: wallet === info.creator.toLowerCase(),
     };
   }
@@ -370,7 +592,7 @@ async function loadContext(cfg) {
 
 /** Fees in bps this wallet pays on a buy / sell right now: the 1% trading fee, plus the .ai rate for .ai wallets or
  *  the rate in force for everyone else (`buyTaxNowBps` / `sellTaxNowBps`: the normal rate during the tax period, the
- *  .ai rate after it). */
+ *  .ai rate after it). Same for BNB launches and stock memes (only the fee currency differs). */
 export function feesFor(info, { hasAgentId }) {
   const buyTax = hasAgentId ? info.agentBuyTaxBps : info.buyTaxNowBps;
   const sellTax = hasAgentId ? info.agentSellTaxBps : info.sellTaxNowBps;
@@ -393,16 +615,42 @@ const HINTS = {
 };
 
 const isCapped = (ctx) => ctx.stage === 'ai-only' || ctx.stage === 'hold-cap';
+const baseSym = (ctx) => ctx.base?.symbol ?? 'bStock';
+const feeUnit = (ctx) => (ctx.kind === 'stock' ? baseSym(ctx) : 'BNB');
+
+function baseSummary(ctx) {
+  const b = ctx.base;
+  const priceInBase = stockPriceWad(ctx.info.sqrtPriceX96, ctx.info.memeIsCurrency0);
+  const usd = (raw) => (b.usdPerRaw === null ? null : formatUnits((raw * b.usdPerRaw) / WAD));
+  return {
+    address: b.address,
+    symbol: b.symbol,
+    name: b.name,
+    uiMultiplier: b.uiMultiplier === null ? null : formatUnits(b.uiMultiplier),
+    usdPerShare: b.usdPerRaw === null ? null : formatUnits(b.uiMultiplier ? (b.usdPerRaw * WAD) / b.uiMultiplier : b.usdPerRaw),
+    memeIsCurrency0: ctx.info.memeIsCurrency0,
+    price: {
+      inBase: formatUnits(priceInBase),
+      inShares: b.uiMultiplier === null ? null : formatUnits((priceInBase * b.uiMultiplier) / WAD),
+      usd: usd(priceInBase),
+    },
+    marketCap: { inBase: formatUnits(priceInBase * 1_000_000_000n), usd: usd(priceInBase * 1_000_000_000n) },
+  };
+}
 
 function summary(ctx) {
   const i = ctx.info;
   return {
     token: { address: ctx.token, symbol: ctx.symbol, decimals: 18 },
+    kind: ctx.kind,
+    base: ctx.kind === 'stock' ? baseSummary(ctx) : null,
+    feeCurrency: feeUnit(ctx),
     stage: ctx.stage,
     route: 'contract-call',
     hint: HINTS[ctx.stage],
     creator: i.creator,
     founder: i.founder,
+    rewards: ctx.rewards,
     windows: {
       launchedAt: formatTime(i.launchTime),
       aiOnlyUntil: formatTime(i.aiOnlyUntil),
@@ -437,6 +685,8 @@ function walletSummary(ctx) {
     isCreator: w.isCreator,
     bnbBalance: formatUnits(w.bnbBalance),
     tokenBalance: formatUnits(w.tokenBalance),
+    ...(ctx.kind === 'stock' ? { baseBalance: formatUnits(w.baseBalance ?? 0n) } : {}),
+    pendingRewards: w.pendingRewards === null ? null : `${formatUnits(w.pendingRewards)} ${feeUnit(ctx)}`,
     canBuy: aiOnly ? w.hasAgentId : true,
     canSell: aiOnly ? w.hasAgentId || w.isCreator : true,
     holdRoom: isCapped(ctx) ? formatUnits(ctx.holdCap > w.tokenBalance ? ctx.holdCap - w.tokenBalance : 0n) : null,
@@ -451,6 +701,9 @@ function stringify(o) {
 const bawCommand = (from, tx) =>
   `baw contract-call preview --binanceChainId ${CHAIN_ID} --from ${from} --to ${tx.to} --value ${tx.value} --inputData ${tx.inputData} --json`;
 
+const txEntry = (purpose, from, tx) => ({ purpose, ...tx, baw: bawCommand(from, tx) });
+const approveTx = (token, spender, amount) => ({ to: token, value: '0', inputData: SEL.approve + encAddr(spender) + word(amount) });
+
 function slippageOf(p) {
   if (p.slippageBps === undefined) return DEFAULT_SLIPPAGE_BPS;
   const s = BigInt(p.slippageBps);
@@ -458,13 +711,70 @@ function slippageOf(p) {
   return s;
 }
 
+const minOf = (out, slip) => (out * (BPS - slip)) / BPS;
+
+/** Quote every candidate V3 route with QuoterV2 and keep the best; failing routes are skipped. */
+export async function bestV3Quote(rpc, routes, amountIn) {
+  const quotes = await Promise.all(
+    routes.map(async (r) => {
+      const path = encodeV3Path(r.tokens, r.fees);
+      const res = await rpc('eth_call', [{ to: V3_QUOTER, data: encodeQuoteExactInput(path, amountIn) }, 'latest'], { allowRevert: true }).catch(() => null);
+      if (res === null || res.revert !== undefined) return null;
+      return { via: r.via, path, out: words(res)[0] ?? 0n };
+    }),
+  );
+  let best = null;
+  for (const q of quotes) if (q && q.out > 0n && (!best || q.out > best.out)) best = q;
+  if (!best) throw fail('NO_ROUTE', 'No PancakeSwap V3 route quoted a positive amount for this bStock');
+  return best;
+}
+
+/** OpenZeppelin v5 upgradeable ERC20 `_allowances` (namespaced storage), then plain layouts. */
+const OZ_UPGRADEABLE_ALLOWANCES = 0x52c63247e1f47db19d5ce0460030c497f067ca4cebf71ba98eeadabe20bace01n;
+const BASE_ALLOWANCE_SLOTS = [OZ_UPGRADEABLE_ALLOWANCES, 1n, 2n, 3n, 51n, 52n];
+
+/** Storage slot of `allowances[owner][spender]` for a mapping at `mappingSlot`. */
+export const allowanceSlotAt = (owner, spender, mappingSlot) =>
+  keccak256(hexToBytes(encAddr(spender) + strip(keccak256(hexToBytes(encAddr(owner) + word(mappingSlot))))));
+
+/** A state override giving `spender` an unlimited allowance on a bStock, found by trying known storage layouts. */
+async function baseAllowanceOverride(rpc, token, owner, spender) {
+  for (const slot of BASE_ALLOWANCE_SLOTS) {
+    const override = { [token]: { stateDiff: { [allowanceSlotAt(owner, spender, slot)]: '0x' + word(MAX_UINT256) } } };
+    const res = await rpc('eth_call', [{ to: token, data: SEL.allowance + encAddr(owner) + encAddr(spender) }, 'latest', override], { allowRevert: true });
+    if (res.revert === undefined && words(res)[0] === MAX_UINT256) return override;
+  }
+  throw fail('APPROVE_FIRST', 'Approve the router for the bStock first, then quote again');
+}
+
+async function simulateOrFail(ctx, tx, override) {
+  const params = [tx, 'latest'];
+  if (override) params.push(override);
+  const sim = await ctx.rpc('eth_call', params, { allowRevert: true });
+  if (sim.revert !== undefined) {
+    const err = decodeRevert(sim.revert);
+    if (err.code === 'HOLDING_CAP_REACHED') {
+      const room = walletSummary(ctx).holdRoom;
+      err.message = `Until ${formatTime(ctx.info.holdCapUntil)} no wallet may hold more than 1% of the supply (${formatUnits(ctx.holdCap)} tokens); this wallet can take ${room} more. Buy less (at the launch price 1% is only about 0.04 BNB of buying).`;
+    }
+    throw fail(err.code, err.message, { ...stringify(err), wallet: walletSummary(ctx) });
+  }
+  return words(sim)[0];
+}
+
+const baseMetaOrFail = (ctx) => {
+  const meta = stockBaseOf(ctx.base.address);
+  if (!meta) throw fail('UNKNOWN_BASE', `No V3 route table for base ${ctx.base.address}; trade with the bStock directly (pay / receive: "base")`);
+  return meta;
+};
+
 // ---- commands ----
 async function cmdInfo(p) {
   const ctx = await loadContext(resolveConfig(p));
   return { ...summary(ctx), wallet: walletSummary(ctx) };
 }
 
-async function cmdQuoteBuy(p) {
+async function buyContext(p) {
   if (!p.wallet) throw fail('INVALID_PARAM', '`wallet` is required (the hook checks the trading wallet)');
   const ctx = await loadContext(resolveConfig(p));
   const w = ctx.walletState;
@@ -473,25 +783,30 @@ async function cmdQuoteBuy(p) {
   }
   const amount = parseUnits(p.amount);
   if (amount === 0n) throw fail('INVALID_PARAM', '`amount` must be > 0');
-  if (amount > w.bnbBalance) throw fail('INSUFFICIENT_BNB', `Wallet holds ${formatUnits(w.bnbBalance)} BNB`, { wallet: walletSummary(ctx) });
   const fees = feesFor(ctx.info, w);
   if (fees.buyTotalBps >= BPS) {
     throw fail('ANTI_SNIPER_BLOCK', `Buys in the launch block are blocked by the anti-sniper fee (${bpsPct(fees.buyTotalBps)}); retry in the next block`);
   }
-  const limit = 0n; // no price limit: the pool runs from the launch price to infinity
+  return { ctx, w, amount, fees, slip: slippageOf(p) };
+}
 
-  const sim = await ctx.rpc('eth_call', [{ from: w.address, to: ctx.router, value: '0x' + amount.toString(16), data: encodeBuy(ctx.key, limit, 0n, w.address) }, 'latest'], { allowRevert: true });
-  if (sim.revert !== undefined) {
-    const err = decodeRevert(sim.revert);
-    if (err.code === 'HOLDING_CAP_REACHED') {
-      const room = walletSummary(ctx).holdRoom;
-      err.message = `Until ${formatTime(ctx.info.holdCapUntil)} no wallet may hold more than 1% of the supply (${formatUnits(ctx.holdCap)} tokens); this wallet can take ${room} more. Buy less (at the launch price 1% is only about 0.04 BNB).`;
-    }
-    throw fail(err.code, err.message, { ...stringify(err), wallet: walletSummary(ctx) });
-  }
-  const out = words(sim)[0];
-  const slip = slippageOf(p);
-  const minOut = (out * (BPS - slip)) / BPS;
+const buyFees = (fees, unit, paidInBase) => ({
+  total: bpsPct(fees.buyTotalBps),
+  [`total${unit === 'BNB' ? 'Bnb' : 'InBase'}`]: formatUnits((paidInBase * fees.buyTotalBps) / BPS),
+  currency: unit,
+  base: bpsPct(fees.baseFeeBps),
+  tax: bpsPct(fees.buyTaxBps),
+  antiSniper: bpsPct(fees.antiSniperBps),
+  pancakeProtocolFee: `${Number(fees.pancakeProtocolFeePips.buy) / 10_000}%`,
+});
+
+async function cmdQuoteBuy(p) {
+  const { ctx, w, amount, fees, slip } = await buyContext(p);
+  if (ctx.kind === 'stock') return quoteStockBuy(p, ctx, w, amount, fees, slip);
+  if (amount > w.bnbBalance) throw fail('INSUFFICIENT_BNB', `Wallet holds ${formatUnits(w.bnbBalance)} BNB`, { wallet: walletSummary(ctx) });
+  const limit = 0n; // no price limit: the pool runs from the launch price to infinity
+  const out = await simulateOrFail(ctx, { from: w.address, to: ctx.router, value: '0x' + amount.toString(16), data: encodeBuy(ctx.key, limit, 0n, w.address) });
+  const minOut = minOf(out, slip);
   const tx = { to: ctx.router, value: amount.toString(), inputData: encodeBuy(ctx.key, limit, minOut, w.address) };
   return {
     ...summary(ctx),
@@ -502,16 +817,58 @@ async function cmdQuoteBuy(p) {
       receiveRaw: out.toString(),
       minReceive: formatUnits(minOut),
       slippageBps: slip.toString(),
-      fees: {
-        total: bpsPct(fees.buyTotalBps),
-        totalBnb: formatUnits((amount * fees.buyTotalBps) / BPS),
-        base: bpsPct(fees.baseFeeBps),
-        tax: bpsPct(fees.buyTaxBps),
-        antiSniper: bpsPct(fees.antiSniperBps),
-        pancakeProtocolFee: `${Number(fees.pancakeProtocolFeePips.buy) / 10_000}%`,
-      },
+      fees: buyFees(fees, 'BNB', amount),
     },
-    transactions: [{ purpose: 'buy', ...tx, baw: bawCommand(w.address, tx) }],
+    transactions: [txEntry('buy', w.address, tx)],
+  };
+}
+
+/** Stock meme buy: `pay: "BNB"` (default, `buyWithBnb` with the best V3 route) or `pay: "base"` (the bStock itself). */
+async function quoteStockBuy(p, ctx, w, amount, fees, slip) {
+  const pay = String(p.pay ?? 'BNB').toLowerCase();
+  if (pay === 'base') {
+    if (amount > w.baseBalance) throw fail('INSUFFICIENT_BASE', `Wallet holds ${formatUnits(w.baseBalance)} ${baseSym(ctx)}`, { wallet: walletSummary(ctx) });
+    const needsApprove = w.baseRouterAllowance < amount;
+    const override = needsApprove ? await baseAllowanceOverride(ctx.rpc, ctx.base.address, w.address, ctx.router) : undefined;
+    const out = await simulateOrFail(ctx, { from: w.address, to: ctx.router, data: encodeStockBuy(ctx.key, amount, 0n, w.address) }, override);
+    const minOut = minOf(out, slip);
+    const txs = [];
+    if (needsApprove) txs.push(txEntry('approve', w.address, approveTx(ctx.base.address, ctx.router, amount)));
+    txs.push(txEntry('buy', w.address, { to: ctx.router, value: '0', inputData: encodeStockBuy(ctx.key, amount, minOut, w.address) }));
+    return {
+      ...summary(ctx),
+      wallet: walletSummary(ctx),
+      estimate: {
+        pay: `${formatUnits(amount)} ${baseSym(ctx)}`,
+        receive: formatUnits(out) + ' ' + (ctx.symbol ?? 'tokens'),
+        receiveRaw: out.toString(),
+        minReceive: formatUnits(minOut),
+        slippageBps: slip.toString(),
+        fees: buyFees(fees, baseSym(ctx), amount),
+      },
+      transactions: txs,
+    };
+  }
+  if (pay !== 'bnb') throw fail('INVALID_PARAM', '`pay` must be "BNB" or "base"');
+  if (amount > w.bnbBalance) throw fail('INSUFFICIENT_BNB', `Wallet holds ${formatUnits(w.bnbBalance)} BNB`, { wallet: walletSummary(ctx) });
+  const leg = await bestV3Quote(ctx.rpc, routesFromBnb(baseMetaOrFail(ctx)), amount);
+  const minBaseOut = minOf(leg.out, slip);
+  const out = await simulateOrFail(ctx, { from: w.address, to: ctx.router, value: '0x' + amount.toString(16), data: encodeBuyWithBnb(ctx.key, leg.path, 0n, 0n, w.address) });
+  const minOut = minOf(out, slip);
+  const tx = { to: ctx.router, value: amount.toString(), inputData: encodeBuyWithBnb(ctx.key, leg.path, minBaseOut, minOut, w.address) };
+  return {
+    ...summary(ctx),
+    wallet: walletSummary(ctx),
+    estimate: {
+      pay: formatUnits(amount) + ' BNB',
+      baseLeg: { route: `WBNB -> ${leg.via === 'USDT' ? 'USDT -> ' : ''}${baseSym(ctx)}`, path: leg.path, baseOut: `${formatUnits(leg.out)} ${baseSym(ctx)}`, minBaseOut: formatUnits(minBaseOut) },
+      receive: formatUnits(out) + ' ' + (ctx.symbol ?? 'tokens'),
+      receiveRaw: out.toString(),
+      minReceive: formatUnits(minOut),
+      slippageBps: slip.toString(),
+      fees: buyFees(fees, baseSym(ctx), leg.out),
+    },
+    transactions: [txEntry('buy', w.address, tx)],
   };
 }
 
@@ -528,33 +885,41 @@ async function cmdQuoteSell(p) {
 
   // Simulate as if the router were already approved: override the allowance slot for this call only.
   const override = { [ctx.token]: { stateDiff: { [allowanceSlot(w.address, ctx.router)]: '0x' + word(MAX_UINT256) } } };
-  const sim = await ctx.rpc('eth_call', [{ from: w.address, to: ctx.router, data: encodeSell(ctx.key, amount, 0n, w.address) }, 'latest', override], { allowRevert: true });
-  if (sim.revert !== undefined) {
-    const err = decodeRevert(sim.revert);
-    throw fail(err.code, err.message, { ...stringify(err), wallet: walletSummary(ctx) });
-  }
-  const out = words(sim)[0];
   const slip = slippageOf(p);
-  const minOut = (out * (BPS - slip)) / BPS;
   const fees = feesFor(ctx.info, w);
-  const txs = [];
-  if (w.routerAllowance < amount) {
-    const approve = { to: ctx.token, value: '0', inputData: SEL.approve + encAddr(ctx.router) + word(amount) };
-    txs.push({ purpose: 'approve', ...approve, baw: bawCommand(w.address, approve) });
+  const receiveIn = ctx.kind === 'stock' ? String(p.receive ?? 'BNB').toLowerCase() : 'bnb';
+  if (receiveIn !== 'bnb' && receiveIn !== 'base') throw fail('INVALID_PARAM', '`receive` must be "BNB" or "base"');
+  let out;
+  let sellData;
+  let leg = null;
+  if (ctx.kind === 'bnb' || receiveIn === 'base') {
+    out = await simulateOrFail(ctx, { from: w.address, to: ctx.router, data: encodeSell(ctx.key, amount, 0n, w.address) }, override);
+    sellData = (minOut) => encodeSell(ctx.key, amount, minOut, w.address);
+  } else {
+    const baseOut = await simulateOrFail(ctx, { from: w.address, to: ctx.router, data: encodeSell(ctx.key, amount, 0n, ctx.router) }, override);
+    leg = await bestV3Quote(ctx.rpc, routesToBnb(baseMetaOrFail(ctx)), baseOut);
+    leg.baseIn = baseOut;
+    out = await simulateOrFail(ctx, { from: w.address, to: ctx.router, data: encodeSellForBnb(ctx.key, amount, leg.path, 0n, w.address) }, override);
+    sellData = (minOut) => encodeSellForBnb(ctx.key, amount, leg.path, minOut, w.address);
   }
-  const sell = { to: ctx.router, value: '0', inputData: encodeSell(ctx.key, amount, minOut, w.address) };
-  txs.push({ purpose: 'sell', ...sell, baw: bawCommand(w.address, sell) });
+  const minOut = minOf(out, slip);
+  const txs = [];
+  if (w.routerAllowance < amount) txs.push(txEntry('approve', w.address, approveTx(ctx.token, ctx.router, amount)));
+  txs.push(txEntry('sell', w.address, { to: ctx.router, value: '0', inputData: sellData(minOut) }));
+  const receiveUnit = receiveIn === 'base' ? baseSym(ctx) : 'BNB';
   return {
     ...summary(ctx),
     wallet: walletSummary(ctx),
     estimate: {
       pay: formatUnits(amount) + ' ' + (ctx.symbol ?? 'tokens'),
-      receive: formatUnits(out) + ' BNB',
+      ...(leg ? { baseLeg: { route: `${baseSym(ctx)} -> ${leg.via === 'USDT' ? 'USDT -> ' : ''}WBNB`, path: leg.path, baseIn: `${formatUnits(leg.baseIn)} ${baseSym(ctx)}` } } : {}),
+      receive: formatUnits(out) + ' ' + receiveUnit,
       receiveRaw: out.toString(),
       minReceive: formatUnits(minOut),
       slippageBps: slip.toString(),
       fees: {
         total: bpsPct(fees.sellTotalBps),
+        currency: feeUnit(ctx),
         base: bpsPct(fees.baseFeeBps),
         tax: bpsPct(fees.sellTaxBps),
         pancakeProtocolFee: `${Number(fees.pancakeProtocolFeePips.sell) / 10_000}%`,
@@ -564,27 +929,193 @@ async function cmdQuoteSell(p) {
   };
 }
 
+async function cmdBases(p) {
+  const cfg = resolveBaseConfig(p);
+  requireStock(cfg, 'factory');
+  const [amounts, feeHex, openHex] = await Promise.all([
+    Promise.all(STOCK_BASES.map((b) => callWord(cfg.rpc, cfg.stock.factory, SEL.startAmountOf + encAddr(b.address)))),
+    call(cfg.rpc, cfg.stock.factory, SEL.launchFee),
+    call(cfg.rpc, cfg.stock.factory, SEL.launchesOpen),
+  ]);
+  return {
+    factory: cfg.stock.factory,
+    launchFee: formatUnits(words(feeHex)[0]) + ' BNB',
+    launchesOpen: words(openHex)[0] === 1n,
+    bases: STOCK_BASES.map((b, i) => ({ symbol: b.symbol, name: b.name, address: b.address, allowed: amounts[i] > 0n, startMarketCap: `${formatUnits(amounts[i])} ${b.symbol}` })).filter(
+      (b) => b.allowed,
+    ),
+  };
+}
+
+function baseParam(p) {
+  const meta = stockBaseOf(p.base);
+  if (!meta) throw fail('UNKNOWN_BASE', `\`base\` must be one of ${STOCK_BASES.map((b) => b.symbol).join(', ')} (symbol or address)`);
+  return meta;
+}
+
+async function cmdQuoteBnbToBase(p) {
+  const cfg = resolveBaseConfig(p);
+  requireStock(cfg, 'router');
+  if (!cfg.wallet) throw fail('INVALID_PARAM', '`wallet` is required (it receives the bStock)');
+  const base = baseParam(p);
+  const amount = parseUnits(p.amount);
+  if (amount === 0n) throw fail('INVALID_PARAM', '`amount` must be > 0');
+  const slip = slippageOf(p);
+  const leg = await bestV3Quote(cfg.rpc, routesFromBnb(base), amount);
+  const minOut = minOf(leg.out, slip);
+  const tx = { to: cfg.stock.router, value: amount.toString(), inputData: encodeBnbToBase(leg.path, base.address, minOut, cfg.wallet) };
+  return {
+    base: { symbol: base.symbol, name: base.name, address: base.address },
+    estimate: {
+      pay: formatUnits(amount) + ' BNB',
+      route: `WBNB -> ${leg.via === 'USDT' ? 'USDT -> ' : ''}${base.symbol}`,
+      receive: `${formatUnits(leg.out)} ${base.symbol}`,
+      receiveRaw: leg.out.toString(),
+      minReceive: formatUnits(minOut),
+      slippageBps: slip.toString(),
+    },
+    transactions: [txEntry('bnbToBase', cfg.wallet, tx)],
+  };
+}
+
+const DAY = 86_400n;
+const intParam = (v, fallback, name) => {
+  if (v === undefined) return fallback;
+  if (!/^\d+$/.test(String(v))) throw fail('INVALID_PARAM', `\`${name}\` must be a whole number`);
+  return BigInt(v);
+};
+
+/** The launch parameters, defaulting like the website: .ai rate 0 (normal 3%), weights 40/30/20/10, 2 min / 1 h / 15 days. */
+export function stockCreateParams(p, base, creator) {
+  const name = String(p.name ?? '').trim();
+  const symbol = String(p.symbol ?? '').trim();
+  if (!name || name.length > 32) throw fail('INVALID_PARAM', '`name` is required (at most 32 characters)');
+  if (!symbol || symbol.length > 12) throw fail('INVALID_PARAM', '`symbol` is required (at most 12 characters)');
+  const agentBuyTaxBps = intParam(p.aiBuyTaxBps, 0n, 'aiBuyTaxBps');
+  const agentSellTaxBps = intParam(p.aiSellTaxBps, 0n, 'aiSellTaxBps');
+  const [wFounder, wHolder, wBurn, wLiquidity] = (p.weights ?? [40, 30, 20, 10]).map((x, i) => intParam(x, 0n, `weights[${i}]`));
+  const taxSeconds = p.taxDays === 'permanent' ? PERMANENT : intParam(p.taxDays, 15n, 'taxDays') * DAY;
+  return {
+    base: base.address,
+    presaleAmount: p.presaleAmount ? parseUnits(p.presaleAmount) : 0n,
+    name,
+    symbol,
+    meta: String(p.meta ?? ''),
+    founder: optionalAddress(p.founder, 'founder') ?? ZERO_ADDRESS,
+    buyTaxBps: agentBuyTaxBps + 300n,
+    sellTaxBps: agentSellTaxBps + 300n,
+    agentBuyTaxBps,
+    agentSellTaxBps,
+    wFounder: wFounder ?? 0n,
+    wHolder: wHolder ?? 0n,
+    wBurn: wBurn ?? 0n,
+    wLiquidity: wLiquidity ?? 0n,
+    minShare: parseUnits(p.minShare ?? '10000'),
+    agentOnlyRewards: p.agentOnlyRewards === true,
+    antiSniper: p.antiSniper !== false,
+    aiOnlySeconds: intParam(p.aiOnlyMinutes, 2n, 'aiOnlyMinutes') * 60n,
+    holdCapSeconds: intParam(p.holdCapMinutes, 60n, 'holdCapMinutes') * 60n,
+    taxSeconds,
+  };
+}
+
+async function cmdBuildCreate(p) {
+  const cfg = resolveBaseConfig(p);
+  requireStock(cfg, 'factory');
+  if (!cfg.wallet) throw fail('INVALID_PARAM', '`wallet` is required (the creator)');
+  const base = baseParam(p);
+  const c = stockCreateParams(p, base, cfg.wallet);
+  const [feeHex, startAmount, baseBal, allowance] = await Promise.all([
+    call(cfg.rpc, cfg.stock.factory, SEL.launchFee),
+    callWord(cfg.rpc, cfg.stock.factory, SEL.startAmountOf + encAddr(base.address)),
+    callWord(cfg.rpc, base.address, SEL.balanceOf + encAddr(cfg.wallet)),
+    callWord(cfg.rpc, base.address, SEL.allowance + encAddr(cfg.wallet) + encAddr(cfg.stock.factory)),
+  ]);
+  if (startAmount === 0n) throw fail('BASE_NOT_ALLOWED', `${base.symbol} is not allowlisted for new launches`);
+  if (c.presaleAmount > baseBal) {
+    throw fail('INSUFFICIENT_BASE', `Wallet holds ${formatUnits(baseBal)} ${base.symbol}; get more with \`quote-bnb-to-base\` first`);
+  }
+  const launchFee = words(feeHex)[0];
+  const data = encodeStockCreate(c);
+  const needsApprove = c.presaleAmount > 0n && allowance < c.presaleAmount;
+  const override = needsApprove ? await baseAllowanceOverride(cfg.rpc, base.address, cfg.wallet, cfg.stock.factory) : undefined;
+  const params = [{ from: cfg.wallet, to: cfg.stock.factory, value: '0x' + launchFee.toString(16), data }, 'latest'];
+  if (override) params.push(override);
+  const sim = await cfg.rpc('eth_call', params, { allowRevert: true });
+  if (sim.revert !== undefined) {
+    const err = decodeRevert(sim.revert);
+    throw fail(err.code, err.message, stringify(err));
+  }
+  const txs = [];
+  if (needsApprove) txs.push(txEntry('approve', cfg.wallet, approveTx(base.address, cfg.stock.factory, c.presaleAmount)));
+  txs.push(txEntry('create', cfg.wallet, { to: cfg.stock.factory, value: launchFee.toString(), inputData: data }));
+  return {
+    base: { symbol: base.symbol, name: base.name, address: base.address, startMarketCap: `${formatUnits(startAmount)} ${base.symbol}` },
+    launchFee: formatUnits(launchFee) + ' BNB',
+    presale: `${formatUnits(c.presaleAmount)} ${base.symbol}`,
+    predictedToken: wordAddr(words(sim)[0]),
+    params: stringify({ ...c, taxSeconds: c.taxSeconds === PERMANENT ? 'permanent' : c.taxSeconds }),
+    note: 'Fees and holder rewards of this launch are paid in ' + base.symbol + '. The token address is predicted from a simulation; read it from the receipt.',
+    transactions: txs,
+  };
+}
+
+async function cmdClaimRewards(p) {
+  if (!p.wallet) throw fail('INVALID_PARAM', '`wallet` is required');
+  const ctx = await loadContext(resolveConfig(p));
+  const pending = ctx.walletState.pendingRewards ?? 0n;
+  const tx = { to: ctx.rewards, value: '0', inputData: SEL.claim };
+  return {
+    token: { address: ctx.token, symbol: ctx.symbol },
+    kind: ctx.kind,
+    rewards: ctx.rewards,
+    pending: `${formatUnits(pending)} ${feeUnit(ctx)}`,
+    pendingRaw: pending.toString(),
+    transactions: pending > 0n ? [txEntry('claim', ctx.walletState.address, tx)] : [],
+  };
+}
+
 async function cmdReceipt(p) {
   const hash = String(p.txHash ?? '');
   if (!/^0x[0-9a-fA-F]{64}$/.test(hash)) throw fail('INVALID_PARAM', '`txHash` must be a 0x-prefixed 32-byte hash');
   const urls = p.rpc ? [p.rpc] : process.env.BSC_RPC_URL ? [process.env.BSC_RPC_URL] : DEFAULT_RPCS;
   const rpc = makeRpc(urls);
+  const stockHook = optionalAddress(p.stockHook ?? process.env.SUAN_STOCK_HOOK ?? MAINNET_STOCK.hook, 'stockHook');
   const r = await rpc('eth_getTransactionReceipt', [hash]);
   if (!r) return { txHash: hash, status: 'pending', note: 'No receipt yet — not mined (or unknown to this node). Re-check shortly.' };
   const fees = [];
   const transfers = [];
   const trades = [];
   const events = [];
+  // Stock-meme hook logs carry amounts in the paired bStock; BNB-hook logs in BNB.
+  const units = new Map();
+  const unitOf = async (log, token) => {
+    if (!stockHook || log.address.toLowerCase() !== stockHook) return 'BNB';
+    if (!units.has(token)) {
+      units.set(token, (async () => {
+        const base = wordAddr(await callWord(rpc, stockHook, SEL.baseOf + encAddr(token)));
+        const symHex = await call(rpc, base, SEL.symbol).catch(() => null);
+        return (symHex && decodeString(symHex)) || stockBaseOf(base)?.symbol || base;
+      })());
+    }
+    return units.get(token);
+  };
   for (const log of r.logs) {
     const t0 = log.topics[0]?.toLowerCase();
     if (t0 === TOPIC.feeTaken && log.topics.length === 3) {
       const [isBuy, base, tax, anti] = words(log.data);
-      fees.push({ token: wordAddr(BigInt(log.topics[1])), trader: wordAddr(BigInt(log.topics[2])), side: isBuy === 1n ? 'BUY' : 'SELL', base: formatUnits(base), tax: formatUnits(tax), antiSniper: formatUnits(anti), totalBnb: formatUnits(base + tax + anti) });
+      const token = wordAddr(BigInt(log.topics[1]));
+      const unit = await unitOf(log, token);
+      const fee = { token, trader: wordAddr(BigInt(log.topics[2])), side: isBuy === 1n ? 'BUY' : 'SELL', currency: unit, base: formatUnits(base), tax: formatUnits(tax), antiSniper: formatUnits(anti) };
+      fees.push(unit === 'BNB' ? { ...fee, totalBnb: formatUnits(base + tax + anti) } : { ...fee, total: formatUnits(base + tax + anti) });
     } else if (t0 === TOPIC.transfer && log.topics.length === 3 && (!p.token || log.address.toLowerCase() === p.token.toLowerCase())) {
       transfers.push({ token: log.address, from: wordAddr(BigInt(log.topics[1])), to: wordAddr(BigInt(log.topics[2])), amount: formatUnits(words(log.data)[0] ?? 0n) });
     } else if (t0 === TOPIC.swapped && log.topics.length === 3) {
-      const [isBuy, bnb, tokens, sqrtPriceX96] = words(log.data);
-      trades.push({ token: wordAddr(BigInt(log.topics[1])), trader: wordAddr(BigInt(log.topics[2])), side: isBuy === 1n ? 'BUY' : 'SELL', bnb: formatUnits(bnb), tokens: formatUnits(tokens), tokensRaw: tokens.toString(), sqrtPriceX96: sqrtPriceX96.toString() });
+      const [isBuy, paid, tokens, sqrtPriceX96] = words(log.data);
+      const token = wordAddr(BigInt(log.topics[1]));
+      const unit = await unitOf(log, token);
+      const amount = unit === 'BNB' ? { bnb: formatUnits(paid) } : { currency: unit, baseAmount: formatUnits(paid) };
+      trades.push({ token, trader: wordAddr(BigInt(log.topics[2])), side: isBuy === 1n ? 'BUY' : 'SELL', ...amount, tokens: formatUnits(tokens), tokensRaw: tokens.toString(), sqrtPriceX96: sqrtPriceX96.toString() });
     } else if (t0 === TOPIC.creatorShareToHolders && log.topics.length === 2) {
       events.push({ event: 'CreatorShareToHolders', token: wordAddr(BigInt(log.topics[1])) });
     }
@@ -603,7 +1134,16 @@ async function cmdReceipt(p) {
   };
 }
 
-const COMMANDS = { info: cmdInfo, 'quote-buy': cmdQuoteBuy, 'quote-sell': cmdQuoteSell, receipt: cmdReceipt };
+const COMMANDS = {
+  info: cmdInfo,
+  'quote-buy': cmdQuoteBuy,
+  'quote-sell': cmdQuoteSell,
+  receipt: cmdReceipt,
+  bases: cmdBases,
+  'quote-bnb-to-base': cmdQuoteBnbToBase,
+  'build-create': cmdBuildCreate,
+  'claim-rewards': cmdClaimRewards,
+};
 
 export async function run(command, params) {
   const fn = COMMANDS[command];

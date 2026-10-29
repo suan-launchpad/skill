@@ -133,7 +133,7 @@ test('selectors, topics and error codes match cast sig / cast keccak', () => {
     'UnknownLaunch()': 'UNKNOWN_LAUNCH',
   };
   for (const [s, code] of Object.entries(errs)) assert.equal(ERRORS[sig(s)]?.[0], code, s);
-  assert.equal(Object.keys(ERRORS).length, 16);
+  assert.equal(Object.keys(ERRORS).length, 25);
 });
 
 test('decodeLaunchInfo rejects a short answer as a wrong hook', () => {

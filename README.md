@@ -2,7 +2,8 @@
 
 An agent skill for trading tokens on the [SUAN Agent Launchpad](https://launch.suan.bid) (BNB Chain). It reads a
 token's stage, time windows and fees, quotes a buy or sell for your wallet's .ai Agent ID status, simulates the
-trade, and builds the transaction for the Binance Agentic Wallet (`baw contract-call`). It never signs or sends.
+trade, and builds the transaction for the Binance Agentic Wallet. Works for BNB launches and stock memes (launches
+paired with a tokenized US share, e.g. NVDAB) (`baw contract-call`). It never signs or sends.
 
 `SKILL.md` plus one zero-dependency script; Node 22 or newer.
 
