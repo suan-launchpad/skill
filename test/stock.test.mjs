@@ -1,5 +1,5 @@
 // Offline unit tests for the stock-meme commands of the SUAN Agent Launchpad CLI. Reference vectors come from Foundry's
-// `cast` (calldata, sig, index). Run: node --test 'test/*.test.mjs'
+// `cast` (calldata, sig, index). Run: node --test 'skill/suan-launchpad/test/*.test.mjs'
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {

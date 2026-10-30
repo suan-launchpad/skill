@@ -1,6 +1,6 @@
 ---
 name: suan-launchpad
-description: Trade tokens launched on SUAN Agent Launchpad, the .ai Agent ID launch protocol on BNB Chain (PancakeSwap Infinity hook pool), including stock memes paired with a bStock (tokenized share such as NVDAB). Use when the user wants to check, quote, buy or sell a SUAN Agent Launchpad token, see its stage (.ai window, hold-cap window, tax period), time windows or fees, check a SUAN Agent Launchpad trade, claim holder rewards, or launch a stock meme. Builds the transaction and executes it with the Binance Agentic Wallet (`baw contract-call`, Developer Mode).
+description: Trade tokens launched on SUAN Agent Launchpad, the .ai Agent ID launch protocol on BNB Chain (PancakeSwap Infinity hook pool), including stock memes paired with a bStock (tokenized share such as NVDAB). Use when the user wants to check, quote, buy or sell a SUAN Agent Launchpad token, see its stage (.ai window, hold-cap window, tax period), time windows or fees, check a SUAN Agent Launchpad trade, claim holder rewards, launch a stock meme, quote, bet, or claim on a SUAN prediction market, or mint, claim, refund, or trade an Agent ID fair-mint token. Builds the transaction and executes it with the Binance Agentic Wallet (`baw contract-call`, Developer Mode).
 ---
 
 # SUAN Agent Launchpad
@@ -149,6 +149,100 @@ temporary allowance in the simulation only, so a quote works before the approval
 ### Holder rewards
 
 `claim-rewards {token, wallet}` shows what is pending; preview and execute the `claim` transaction to receive it.
+
+## Prediction markets
+
+Pari-mutuel markets on `SuanPredict`, staked in BNB. Winners split the losing pools after a 3% fee on those losing pools only. The fee goes to `SuanBuyBurn`. These commands only read the chain and build calldata. They never sign or send.
+
+Set `predict` (or `SUAN_PREDICT`) to the deployed contract. There is no default address.
+
+| Command | Params | What it does |
+|---|---|---|
+| `predict-markets` | `predict`, `limit?` (default 20, max 50) | The newest markets: status, pools, and odds in basis points (each pool's share of the total) |
+| `predict-quote` | `predict`, `id`, `outcome`, `amount` (BNB), `wallet?` | Current odds, the multiplier after the 3% losing-pool fee, and the payout if this bet wins. With `wallet`, also the `bet` transaction |
+| `predict-bet` | `predict`, `wallet`, `id`, `outcome`, `amount` (BNB) | Builds `bet(id, outcome)` with `value` set to the stake. Does not simulate a fill |
+| `predict-claim` | `predict`, `wallet`, `id` or `ids` | Builds `claim` or `claimMany`. A single id also reads `claimable` |
+
+`outcome` is `0` for Yes / Up / "CZ more", `1` for No / Down / "He Yi more", and `2` for a tie on the CZ / He Yi duel. Preview with `transactions[0].baw`, show the user the preview, and execute only after they confirm.
+
+### Tweet counting
+
+Only CZ (@cz_binance, id `902926941413453824`) and He Yi (@heyibinance, id `1003840309166366721`). The window is 00:00:00–23:59:59 Beijing time of the post's X `created_at`, to the second.
+
+Counted: original posts (including media and polls), quote posts, and a self-thread (a reply whose `in_reply_to_user_id` is the author). Not counted: replies to other people, pure reposts, and undone reposts.
+
+Deleted posts do not count. Before a result is proposed, every stored post that day is re-checked with `GET /2/tweets?ids=` (at most 100 ids a request). A missing post is excluded with reason `deleted`, and `deletedAt` is stored. An edited post counts once. A keyword hits if any captured version contains it. Edit history comes from the stream's edit fields and `edit_history_tweet_ids`.
+
+Keywords are case-insensitive whole tokens. `BNB` matches `BNB`, `$BNB`, and `#BNB`, and does not match `BNBChain`. Emoji and Chinese keywords match literally. A Chinese post contains at least one CJK Unified Ideograph.
+
+If an account is locked, suspended, or renamed so the day cannot be counted, the market is cancelled and stakes are refunded. The fee is 3% of the losing pools only, and it buys back and burns $SUAN. A tie on "will replies outnumber posts" resolves No.
+
+| Code | Meaning |
+|---|---|
+| `PREDICT_NOT_CONFIGURED` | No `predict` address |
+| `INVALID_OUTCOME` | `outcome` is not 0–7, or the quote names an outcome the market does not have |
+
+## Agent ID 公平 Mint（代币版）
+
+`.ai` Agent ID 持有者按创建时写死的分档价格购买份数。达标后任何人可以 `finalize`：2% 进 SuanBuyBurn，项目方份额线性解锁，其余 BNB 与对应代币在 PancakeSwap V2 建池，LP 转到黑洞。未达标则每人 `refund` 拿回全部付款，项目方保证金没收。开池后的币没有黑名单。创建时可以选一个交易税：只对这个币自己的 V2 交易对收税，买和卖各不超过 5%（500 bps），`.ai` 持有者付更低的代理税率。每笔税的 10% 进平台税池（再换成 BNB 买回 $SUAN），其余按 `burnShareBps` 销毁，剩下的给创建者。钱包之间转账不收税。税可以在 1 天到 365 天之后结束，也可以永久。全 0 表示没有税。
+
+这些命令只读链、在本地拼交易，交给用户钱包签名。它们不接收、不保存、不发送私钥。
+
+默认使用 BSC 主网合约：工厂 `0xb9b7d9384F22512C7A5E657fF9FF804D89Cf3b64`，路由 `0x9FD3887A0e0910f905Ad6F2E637cB514d5f9Eb7f`（均已在 BscScan 开源验证）。需要时可传入 `factory` / `router`，或设置 `SUAN_FAIRMINT_FACTORY` / `SUAN_FAIRMINT_ROUTER` 覆盖。
+
+| 命令 | 参数 | 作用 |
+|---|---|---|
+| `mint-list` | `limit?`, `factory?` | 最近的销售：状态、已售、上限、截止时间 |
+| `mint-info` | `sale`, `wallet?` | 进度、下一份价格、池子地址；有钱包时说明是否持有 `.ai` |
+| `mint-quote` | `sale`, `shares`, `wallet?`, `ref?` | `costOf` 报价。有钱包时附上 `mint` 交易 |
+| `mint` | `sale`, `wallet`, `shares`, `ref?` | 构建 `mint(shares, referrer)`。没有 `.ai` 时返回 `NO_AGENT_ID`，不发交易 |
+| `mint-claim` | `sale`, `wallet` | 开池后领取该钱包的代币 |
+| `mint-refund` | `sale`, `wallet` | 失败后退回该钱包付过的 BNB |
+| `mint-create` | `wallet`, `paramsFile` 或 `params`, `factory?` | 先按工厂规则 `validate`，不通过则 `BAD_PARAMS` 且不访问 RPC；通过后构建 `create`，`value` 为创建费加保证金 |
+| `fm-buy` | `token`, `wallet`, `bnb`, `router?`, `slippageBps?`, `direct?` | 默认走 SuanV2Router（买入的 BNB 扣 1%）。`direct: true` 直接走 PancakeSwap V2，不扣这 1%。报价和滑点都扣掉这个钱包的买入税（`.ai` 用代理税率） |
+| `fm-sell` | `token`, `wallet`, `amount`, `router?`, `slippageBps?`, `direct?` | 同上，按卖出税。交易列表先 `approve` 再卖出 |
+
+`mint-create` 的 JSON：`name`, `symbol`, `meta`, `tiers`（`upTo` 为累计份数，`price` 为每份 BNB，可写 wei 或 `"0.001"`）, `maxShares`, `targetShares`, `deadline`（unix 秒）, `perWallet`, `inviteBonus`, `maxInviteBonus`, `creatorBnbBps`, `creatorTokenBps`, `vestingSeconds`, `tax`。`tax` 可省略，省略等于全 0。字段：`buyBps`, `sellBps`, `agentBuyBps`, `agentSellBps`, `burnShareBps`, `duration`（秒；有税时为 1 天到 365 天，或 `4294967295` 表示永久）。`fm-buy` / `fm-sell` 的结果里有 `isAgent`, `taxBps`, `taxWei`, `platformWei`, `burnedWei`, `creatorWei`。`minOutWei` 是扣税之后再扣滑点。
+
+先 `mint-info`。没有 `.ai` 就说明原因并停。用户确认预览之后才 `baw contract-call execute`。
+
+| 代码 | 含义 |
+|---|---|
+| `FAIRMINT_NOT_CONFIGURED` | 没有工厂或路由地址 |
+| `BAD_PARAMS` | 参数不符合工厂规则，`message` 是合约的 `BadParams` 原因 |
+| `NO_AGENT_ID` | 钱包没有 `.ai` Agent ID |
+| `NO_PAIR` | 代币还没有 V2 交易对 |
+
+## Agent ID fair mint (token)
+
+Holders of a `.ai` Agent ID buy shares at the tier prices fixed at creation. Anyone may `finalize` once the sale is ready: 2% goes to SuanBuyBurn, the creator's share vests linearly, and the rest of the BNB is paired with tokens in a PancakeSwap V2 pool whose LP is sent to the dead address. If the sale misses its target, each minter `refund`s exactly what they paid and the creator's bond is forfeited. The launched token has no blacklist. The creator may set a trading tax: only trades with the token's own V2 pair are taxed, buy and sell are each at most 5% (500 bps), and a `.ai` holder pays the lower agent rate. Of every tax, 10% goes to the platform tax sink (sold for BNB that buys back $SUAN), `burnShareBps` of the rest is burned, and the remainder goes to the creator. Wallet-to-wallet transfers are not taxed. The tax lasts from 1 day to 365 days, or forever. All zeros means no tax.
+
+These commands only read the chain and build a transaction for the user's wallet to sign locally. They never accept, store, or send a private key.
+
+Defaults to the BSC mainnet contracts: factory `0xb9b7d9384F22512C7A5E657fF9FF804D89Cf3b64`, router `0x9FD3887A0e0910f905Ad6F2E637cB514d5f9Eb7f` (both verified on BscScan). Override with `factory` / `router`, or `SUAN_FAIRMINT_FACTORY` / `SUAN_FAIRMINT_ROUTER`.
+
+| Command | Params | What it does |
+|---|---|---|
+| `mint-list` | `limit?`, `factory?` | Newest sales: status, sold, max, deadline |
+| `mint-info` | `sale`, `wallet?` | Progress, next share price, pool addresses, and whether `wallet` holds a `.ai` |
+| `mint-quote` | `sale`, `shares`, `wallet?`, `ref?` | `costOf` quote. With a wallet, also the `mint` transaction |
+| `mint` | `sale`, `wallet`, `shares`, `ref?` | Builds `mint(shares, referrer)`. Returns `NO_AGENT_ID` and no transaction when the wallet has no `.ai` |
+| `mint-claim` | `sale`, `wallet` | Claim this wallet's tokens after launch |
+| `mint-refund` | `sale`, `wallet` | Take back this wallet's BNB after a failed sale |
+| `mint-create` | `wallet`, `paramsFile` or `params`, `factory?` | Runs the factory's `validate` first. `BAD_PARAMS` stops before any RPC. Otherwise builds `create` with `value` = creation fee + bond |
+| `fm-buy` | `token`, `wallet`, `bnb`, `router?`, `slippageBps?`, `direct?` | Buys through SuanV2Router (1% of the BNB). `direct: true` uses the PancakeSwap V2 router with no router fee. The quote and the slippage both use this wallet's buy tax (the agent rate when it holds a `.ai`) |
+| `fm-sell` | `token`, `wallet`, `amount`, `router?`, `slippageBps?`, `direct?` | Same, with the sell tax. The transaction list is `approve`, then the sell |
+
+`mint-create` JSON: `name`, `symbol`, `meta`, `tiers` (`upTo` is the cumulative share count, `price` is BNB per share as wei or `"0.001"`), `maxShares`, `targetShares`, `deadline` (unix seconds), `perWallet`, `inviteBonus`, `maxInviteBonus`, `creatorBnbBps`, `creatorTokenBps`, `vestingSeconds`, `tax`. Omit `tax` for no tax. Fields: `buyBps`, `sellBps`, `agentBuyBps`, `agentSellBps`, `burnShareBps`, `duration` (seconds; with a tax, 1 day to 365 days, or `4294967295` for permanent). `fm-buy` / `fm-sell` return `isAgent`, `taxBps`, `taxWei`, `platformWei`, `burnedWei`, `creatorWei`. `minOutWei` is the after-tax amount minus slippage.
+
+Run `mint-info` first. Stop and explain when the wallet has no `.ai`. Execute `baw contract-call` only after the user confirms the preview.
+
+| Code | Meaning |
+|---|---|
+| `FAIRMINT_NOT_CONFIGURED` | No factory or router address |
+| `BAD_PARAMS` | Params break a factory rule. `message` is the contract's `BadParams` reason |
+| `NO_AGENT_ID` | The wallet has no `.ai` Agent ID |
+| `NO_PAIR` | The token has no V2 pair yet |
 
 ## Safety
 

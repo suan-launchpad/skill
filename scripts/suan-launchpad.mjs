@@ -28,8 +28,9 @@
 // Addresses: `hook` and `router` params, or SUAN_LAUNCHPAD_HOOK / SUAN_LAUNCHPAD_ROUTER, else the mainnet deployment. RPC: `rpc` param, BSC_RPC_URL, or the
 // public BSC endpoints below.
 
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { createFairmintCommands } from './fairmint.mjs';
 
 // ---- constants ----
 /** Per-request RPC timeout; SUAN_RPC_TIMEOUT_MS raises it (a fresh local fork fetches state slowly). */
@@ -1134,6 +1135,196 @@ async function cmdReceipt(p) {
   };
 }
 
+// ---- SUAN Predictions (pari-mutuel, BNB). Builds the transaction; it never signs or sends. ----
+const predictUtf8 = (s) => new TextEncoder().encode(s);
+const predictSig = (s) => keccak256(predictUtf8(s)).slice(0, 10);
+export const PREDICT_SEL = {
+  bet: predictSig('bet(uint256,uint8)'),
+  claim: predictSig('claim(uint256)'),
+  claimMany: predictSig('claimMany(uint256[])'),
+  marketCount: predictSig('marketCount()'),
+  marketInfo: predictSig('marketInfo(uint256)'),
+  poolsOf: predictSig('poolsOf(uint256)'),
+  claimable: predictSig('claimable(uint256,address)'),
+};
+const PREDICT_STATUS = ['open', 'proposed', 'disputed', 'resolved', 'cancelled'];
+
+/** `bet(uint256,uint8)`. */
+export function encodePredictBet(id, outcome) {
+  return PREDICT_SEL.bet + word(id) + word(outcome);
+}
+/** `claim(uint256)`. */
+export function encodePredictClaim(id) {
+  return PREDICT_SEL.claim + word(id);
+}
+/** `claimMany(uint256[])`. */
+export function encodePredictClaimMany(ids) {
+  return PREDICT_SEL.claimMany + word(32) + word(ids.length) + ids.map((id) => word(id)).join('');
+}
+
+/**
+ * Odds are the pool's share of the total. The multiplier and the quoted payout take 3% of the losing pool only.
+ * The quote assumes this amount is the whole stake on `outcome`.
+ */
+export function quotePredict({ totalWei, poolsWei, outcome, amountWei }) {
+  const total = BigInt(totalWei);
+  const pools = poolsWei.map((pool) => BigInt(pool));
+  const amount = BigInt(amountWei);
+  if (!Number.isInteger(outcome) || outcome < 0 || outcome >= pools.length) throw fail('INVALID_OUTCOME', '`outcome` is not one of this market\'s outcomes');
+  const pool = pools[outcome] ?? 0n;
+  const oddsBps = total > 0n && pool > 0n ? Number((pool * 10_000n) / total) : 0;
+  const feeNow = pool > 0n && total >= pool ? ((total - pool) * 300n) / 10_000n : 0n;
+  const multiplierWei = pool > 0n ? ((total - feeNow) * 10n ** 18n) / pool : null;
+  const newPool = pool + amount;
+  const newTotal = total + amount;
+  const fee = newPool > 0n ? ((newTotal - newPool) * 300n) / 10_000n : 0n;
+  const payout = amount > 0n && newPool > 0n ? (amount * (newTotal - fee)) / newPool : 0n;
+  return {
+    outcome,
+    oddsBps,
+    multiplier: multiplierWei === null ? null : formatUnits(multiplierWei),
+    payout: formatUnits(payout),
+    payoutWei: payout.toString(),
+    feeWei: fee.toString(),
+    amount: formatUnits(amount),
+  };
+}
+
+/** ABI encoding of `MarketView` (11 static words, then two strings). Offsets are from the start of the tuple. */
+export function encodeMarketView(v) {
+  const strings = [String(v.metaURI ?? ''), String(v.evidenceURI ?? '')];
+  const headWords = 13;
+  let cursor = headWords * 32;
+  const offsets = [];
+  const tails = [];
+  for (const value of strings) {
+    offsets.push(cursor);
+    const bytes = predictUtf8(value);
+    const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+    const padded = Math.ceil(bytes.length / 32) * 32;
+    tails.push(word(bytes.length) + hex.padEnd(padded * 2, '0'));
+    cursor += 32 + padded;
+  }
+  const head = [v.kind, v.outcomes, v.closeTime, v.resolveAfter, v.proposedAt, v.status, v.proposedOutcome, v.winningOutcome, v.maxPool, v.total, v.fee, offsets[0], offsets[1]];
+  return '0x' + head.map((part) => word(part)).join('') + tails.join('');
+}
+
+export function decodeMarketView(hex) {
+  const w = words(hex);
+  if (w.length < 13) throw fail('BAD_PREDICT', 'marketInfo returned a short answer');
+  const readString = (offset) => {
+    const pos = Number(offset / 32n);
+    const len = Number(w[pos] ?? 0n);
+    if (len === 0) return '';
+    const packed = w.slice(pos + 1).map((part) => part.toString(16).padStart(64, '0')).join('').slice(0, len * 2);
+    return new TextDecoder().decode(hexToBytes('0x' + packed));
+  };
+  return {
+    kind: Number(w[0]),
+    outcomes: Number(w[1]),
+    closeTime: w[2].toString(),
+    resolveAfter: w[3].toString(),
+    proposedAt: w[4].toString(),
+    status: PREDICT_STATUS[Number(w[5])] ?? 'open',
+    proposedOutcome: Number(w[6]),
+    winningOutcome: Number(w[7]),
+    maxPool: w[8].toString(),
+    total: w[9].toString(),
+    fee: w[10].toString(),
+    metaURI: readString(w[11]),
+    evidenceURI: readString(w[12]),
+  };
+}
+
+/** A single `uint256[]` return: offset, length, elements. */
+export function decodeUintArray(hex) {
+  const w = words(hex);
+  if (w.length === 0) return [];
+  const start = Number(w[0] / 32n);
+  const len = Number(w[start] ?? 0n);
+  return w.slice(start + 1, start + 1 + len);
+}
+
+function predictAddressOf(p) {
+  const value = p.predict ?? process.env.SUAN_PREDICT;
+  if (!ADDR_RE.test(value ?? '')) throw fail('PREDICT_NOT_CONFIGURED', 'Pass `predict` (the SuanPredict address) or set SUAN_PREDICT');
+  return value.toLowerCase();
+}
+
+function predictRpc(p) {
+  const urls = p.rpc ? [p.rpc] : process.env.BSC_RPC_URL ? [process.env.BSC_RPC_URL] : DEFAULT_RPCS;
+  return makeRpc(urls);
+}
+
+function predictOutcome(p) {
+  const outcome = Number(p.outcome);
+  if (!Number.isInteger(outcome) || outcome < 0 || outcome > 7) throw fail('INVALID_OUTCOME', '`outcome` must be an integer from 0 to 7');
+  return outcome;
+}
+
+async function cmdPredictMarkets(p) {
+  const predict = predictAddressOf(p);
+  const rpc = predictRpc(p);
+  const count = words(await call(rpc, predict, PREDICT_SEL.marketCount))[0] ?? 0n;
+  const limit = Math.min(Math.max(Number(p.limit ?? 20), 1), 50);
+  const items = [];
+  const start = count > BigInt(limit) ? count - BigInt(limit) + 1n : 1n;
+  for (let id = count; id >= start && id >= 1n; id -= 1n) {
+    const info = decodeMarketView(await call(rpc, predict, PREDICT_SEL.marketInfo + word(id)));
+    const pools = decodeUintArray(await call(rpc, predict, PREDICT_SEL.poolsOf + word(id)));
+    items.push({
+      id: id.toString(),
+      ...info,
+      poolsWei: pools.map((pool) => pool.toString()),
+      oddsBps: pools.map((pool) => (BigInt(info.total) > 0n ? Number((pool * 10_000n) / BigInt(info.total)) : 0)),
+    });
+  }
+  return { count: count.toString(), items };
+}
+
+async function cmdPredictQuote(p) {
+  const predict = predictAddressOf(p);
+  const id = BigInt(p.id);
+  const outcome = predictOutcome(p);
+  const amount = parseUnits(String(p.amount ?? '0'));
+  const rpc = predictRpc(p);
+  const info = decodeMarketView(await call(rpc, predict, PREDICT_SEL.marketInfo + word(id)));
+  const pools = decodeUintArray(await call(rpc, predict, PREDICT_SEL.poolsOf + word(id)));
+  const quote = quotePredict({ totalWei: info.total, poolsWei: pools, outcome, amountWei: amount });
+  const wallet = p.wallet?.toLowerCase();
+  const inputData = encodePredictBet(id, outcome);
+  return {
+    marketId: id.toString(),
+    status: info.status,
+    ...quote,
+    transaction: wallet && ADDR_RE.test(wallet) ? txEntry('bet', wallet, { to: predict, value: amount.toString(), inputData }) : null,
+  };
+}
+
+async function cmdPredictBet(p) {
+  const predict = predictAddressOf(p);
+  if (!ADDR_RE.test(p.wallet ?? '')) throw fail('INVALID_PARAM', '`wallet` must be a 0x address');
+  const id = BigInt(p.id);
+  const outcome = predictOutcome(p);
+  const amount = parseUnits(String(p.amount));
+  const inputData = encodePredictBet(id, outcome);
+  return { marketId: id.toString(), outcome, amount: formatUnits(amount), transactions: [txEntry('bet', p.wallet.toLowerCase(), { to: predict, value: amount.toString(), inputData })] };
+}
+
+async function cmdPredictClaim(p) {
+  const predict = predictAddressOf(p);
+  if (!ADDR_RE.test(p.wallet ?? '')) throw fail('INVALID_PARAM', '`wallet` must be a 0x address');
+  const ids = (Array.isArray(p.ids) ? p.ids : [p.id]).map((id) => BigInt(id));
+  if (ids.length === 0 || ids.some((id) => id < 0n)) throw fail('INVALID_PARAM', '`id` or `ids` is required');
+  const inputData = ids.length === 1 ? encodePredictClaim(ids[0]) : encodePredictClaimMany(ids);
+  let claimable = null;
+  if (ids.length === 1) {
+    const rpc = predictRpc(p);
+    claimable = formatUnits(words(await call(rpc, predict, PREDICT_SEL.claimable + word(ids[0]) + encAddr(p.wallet)))[0] ?? 0n);
+  }
+  return { ids: ids.map((id) => id.toString()), claimable, transactions: [txEntry('claim', p.wallet.toLowerCase(), { to: predict, value: '0', inputData })] };
+}
+
 const COMMANDS = {
   info: cmdInfo,
   'quote-buy': cmdQuoteBuy,
@@ -1143,6 +1334,24 @@ const COMMANDS = {
   'quote-bnb-to-base': cmdQuoteBnbToBase,
   'build-create': cmdBuildCreate,
   'claim-rewards': cmdClaimRewards,
+  'predict-markets': cmdPredictMarkets,
+  'predict-quote': cmdPredictQuote,
+  'predict-bet': cmdPredictBet,
+  'predict-claim': cmdPredictClaim,
+  ...createFairmintCommands({
+    fail,
+    txEntry,
+    call,
+    makeRpc,
+    ADDR_RE,
+    defaultRpcs: DEFAULT_RPCS,
+    defaultSlippageBps: DEFAULT_SLIPPAGE_BPS,
+    agentId: AGENT_ID_NFT,
+    wbnb: WBNB,
+    v2Factory: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
+    v2Router: '0x10ED43C718714eb63d5aA57B78B54704E256024E',
+    readFile: (path) => readFileSync(path, 'utf8'),
+  }),
 };
 
 export async function run(command, params) {
